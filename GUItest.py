@@ -5,6 +5,8 @@ import numpy as np
 import csv
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import time
+import threading
 
 
 class ShapeGridGUI:
@@ -26,11 +28,12 @@ class ShapeGridGUI:
 
         # Canvas
         self.canvas = tk.Canvas(master, width=canvas_size, height=canvas_size, bg="white")
-        self.canvas.pack()
+        self.canvas.pack(side=tk.LEFT)
 
         self.vertices = []
         self.polygon_drawn = False
         self.grid_points = []
+        self.big_jumps = []  # list of tuples: ((x1,y1),(x2,y2), dist_idx, dist_um)
 
         # Rectangle selection state
         self.rect_mode = False
@@ -76,12 +79,24 @@ class ShapeGridGUI:
 
         self.reset_view_button = tk.Button(self.control_frame, text="Reset View", command=self.reset_view)
         self.reset_view_button.grid(row=0, column=5, padx=5)
+
+        # Jump threshold UI (micrometers)
+        tk.Label(self.control_frame, text="Jump Thresh (µm):").grid(row=0, column=6, padx=(20,4))
+        self.jump_thresh_entry = tk.Entry(self.control_frame, width=6)
+        self.jump_thresh_entry.insert(0, "0.4")  # default: 0.4 µm (2 index steps)
+        self.jump_thresh_entry.grid(row=0, column=7, padx=4)
+
+        # Simulate button
+        self.sim_button = tk.Button(self.control_frame, text="Simulate Scan", command=self.simulate_scan)
+        self.sim_button.grid(row=0, column=8, padx=5)
+
         # Heatmap storage
         self.heatmap_data = np.full((self.roi_size, self.roi_size), np.nan)
 
         # Matplotlib heatmap figure inside Tkinter
         fig = Figure(figsize=(4, 4))
         self.ax = fig.add_subplot(111)
+        # Keep top-left as origin to match Tk canvas look
         self.im = self.ax.imshow(self.heatmap_data,
                                  origin="upper",
                                  cmap="inferno",
@@ -90,56 +105,71 @@ class ShapeGridGUI:
 
         self.canvas_plot = FigureCanvasTkAgg(fig, master=master)
         self.canvas_plot.get_tk_widget().pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
-        self.sim_button = tk.Button(self.control_frame, text="Simulate Scan", command=self.simulate_scan)
-        self.sim_button.grid(row=0, column=6, padx=5)
 
+    # --------- Heatmap update / simulation ---------
     def update_heatmap(self, ix, iy, value):
         """Update heatmap with new scan value"""
-        self.heatmap_data[iy, ix] = value  # note: [row, col] = [y, x]
+        self.heatmap_data[iy, ix] = value  # matrix indexing: row=y, col=x
+        if not hasattr(self, "clim_set"):
+            self.im.set_clim(0, 100)  # adjust to expected PMT range
+            self.clim_set = True
         self.im.set_data(self.heatmap_data)
-        self.im.autoscale()
         self.canvas_plot.draw()
 
     def simulate_scan(self):
-        import time
-        import threading
+        """Simulate scanning and insert extra delay on big jumps"""
+        if not self.grid_points:
+            print("No scan path. Generate grid first.")
+            return
+
+        try:
+            jump_thresh_um = float(self.jump_thresh_entry.get())
+        except ValueError:
+            jump_thresh_um = 0.4
+
+        jump_thresh_idx = jump_thresh_um / self.galvo_step_um
+
         def run():
-            for ix, iy in self.grid_points:  # snake path order
-                value = np.random.randint(10, 100)  # fake intensity
-                self.update_heatmap(ix, iy, value)
-                #time.sleep(0.01)  # simulate measurement time
+            prev = None
+            for pt in self.grid_points:
+                if prev is not None:
+                    dx = abs(pt[0] - prev[0])
+                    dy = abs(pt[1] - prev[1])
+                    dist_idx = (dx*dx + dy*dy) ** 0.5
+                    # Delay policy: longer wait for big jumps
+                    if dist_idx > jump_thresh_idx:
+                        time.sleep(0.05)  # big jump delay
+                    else:
+                        time.sleep(0.01)  # normal dwell
+                # fake signal
+                val = np.random.randint(10, 100)
+                self.update_heatmap(pt[0], pt[1], val)
+                prev = pt
+
         threading.Thread(target=run, daemon=True).start()
 
+    # --------- Coord transforms, zoom & pan ---------
     def px_to_idx(self, x, y):
-        """Convert canvas pixels → galvo indices (apply pan/zoom inverse)"""
         return int(round((x - self.pan_x) / self.scale)), int(round((y - self.pan_y) / self.scale))
 
     def idx_to_px(self, ix, iy):
-        """Convert galvo indices → canvas pixels (apply pan/zoom)"""
         return ix * self.scale + self.pan_x, iy * self.scale + self.pan_y
 
     def inside_roi(self, x, y):
-        """Check if a pixel click is inside the ROI box (with pan/zoom considered)"""
         ix, iy = self.px_to_idx(x, y)
         return 0 <= ix < self.roi_size and 0 <= iy < self.roi_size
 
     def zoom(self, event):
-        """Zoom in/out with mouse wheel"""
         old_scale = self.scale
-        if event.num == 5 or event.delta < 0:  # scroll down
+        if event.num == 5 or event.delta < 0:
             self.scale /= 1.2
-        elif event.num == 4 or event.delta > 0:  # scroll up
+        elif event.num == 4 or event.delta > 0:
             self.scale *= 1.2
-
-        # Clamp zoom
         self.scale = max(1, min(self.scale, 100))
-
-        # Adjust pan so zoom centers around mouse position
         mouse_x, mouse_y = event.x, event.y
         factor = self.scale / old_scale
         self.pan_x = mouse_x - factor * (mouse_x - self.pan_x)
         self.pan_y = mouse_y - factor * (mouse_y - self.pan_y)
-
         self.redraw()
 
     def start_pan(self, event):
@@ -158,32 +188,30 @@ class ShapeGridGUI:
         self._drag_start = None
 
     def reset_view(self):
-        """Reset zoom and pan"""
         self.scale = 3
         self.pan_x = 0
         self.pan_y = 0
         self.redraw()
 
+    # --------- Drawing ---------
     def redraw(self):
         self.canvas.delete("all")
-
-        # Draw ROI box
+        # ROI
         px1, py1 = self.idx_to_px(0, 0)
         px2, py2 = self.idx_to_px(self.roi_size, self.roi_size)
         self.canvas.create_rectangle(px1, py1, px2, py2, outline="blue", dash=(4, 2), width=2)
 
-        # Draw polygon
+        # Polygon
         if self.vertices:
             coords = [self.idx_to_px(ix, iy) for ix, iy in self.vertices]
             for (x1, y1), (x2, y2) in zip(coords, coords[1:]):
                 self.canvas.create_line(x1, y1, x2, y2, tags="shape")
             if self.polygon_drawn:
                 self.canvas.create_line(coords[-1][0], coords[-1][1], coords[0][0], coords[0][1], tags="shape")
-
             for (px, py) in coords:
                 self.canvas.create_oval(px-3, py-3, px+3, py+3, fill="black", tags="shape")
 
-        # Draw grid spots
+        # Spots
         if self.grid_points:
             spot_radius_idx = (0.5 / 2) / self.galvo_step_um
             spot_radius_px = spot_radius_idx * self.scale
@@ -193,6 +221,14 @@ class ShapeGridGUI:
                                         px + spot_radius_px, py + spot_radius_px,
                                         outline="red", tags="gridpoint")
 
+        # Draw jump segments (orange)
+        if self.big_jumps:
+            for (a, b, _, _) in self.big_jumps:
+                ax, ay = self.idx_to_px(*a)
+                bx, by = self.idx_to_px(*b)
+                self.canvas.create_line(ax, ay, bx, by, fill="orange", width=2, dash=(4, 3), tags="jumpline")
+
+    # --------- Polygon editing ---------
     def toggle_rectangle_mode(self):
         self.rect_mode = not self.rect_mode
         self.rect_start = None
@@ -212,15 +248,12 @@ class ShapeGridGUI:
             return
 
         ix, iy = self.px_to_idx(event.x, event.y)
-
         if self.rect_mode:
             if self.rect_start is None:
-                # First corner
                 self.rect_start = (ix, iy)
                 px, py = self.idx_to_px(ix, iy)
                 self.canvas.create_oval(px-3, py-3, px+3, py+3, fill="black", tags="shape")
             else:
-                # Second corner → define rectangle
                 x1, y1 = self.rect_start
                 x2, y2 = ix, iy
                 self.vertices = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
@@ -230,7 +263,6 @@ class ShapeGridGUI:
                 self.polygon_drawn = True
                 self.rect_start = None
         else:
-            # Normal polygon mode
             self.vertices.append((ix, iy))
             px, py = self.idx_to_px(ix, iy)
             self.canvas.create_oval(px-3, py-3, px+3, py+3, fill="black", tags="shape")
@@ -245,47 +277,99 @@ class ShapeGridGUI:
             self.canvas.create_line(px1, py1, px2, py2, tags="shape")
             self.polygon_drawn = True
 
+    # --------- Grid generation (axis-priority nearest-neighbor) + jump logging ---------
     def generate_grid(self):
         if not self.polygon_drawn:
             return
 
+        # clear old
+        self.grid_points.clear()
+        self.big_jumps.clear()
+        self.canvas.delete("gridpoint")
+        self.canvas.delete("jumpline")
+
+        # Build polygon + bounds
         poly = Polygon(self.vertices)
         minx, miny, maxx, maxy = poly.bounds
-
-        # Clamp to ROI
         minx = max(minx, 0)
         miny = max(miny, 0)
         maxx = min(maxx, self.roi_size - 1)
         maxy = min(maxy, self.roi_size - 1)
 
-        self.grid_points.clear()
-        self.canvas.delete("gridpoint")
-
-        # Laser spot radius: 0.25 µm / 0.2 µm per step = 1.25 index units
-        spot_radius_idx = (0.5 / 2) / self.galvo_step_um
-        spot_radius_px = spot_radius_idx * self.scale
-
-        # Generate grid points (indices)
+        # Gather candidate points
+        candidates = []
         for iy in range(int(miny), int(maxy) + 1):
-            row_points = []
             for ix in range(int(minx), int(maxx) + 1):
                 p = Point(ix, iy)
-                if poly.contains(p) or poly.buffer(1).contains(p):  # buffer=1 idx margin
-                    row_points.append((ix, iy))
+                if poly.contains(p) or poly.buffer(1).contains(p):
+                    candidates.append((ix, iy))
 
-            # Alternate direction every row (snake scan)
-            if iy % 2 == 1:
-                row_points.reverse()
+        if not candidates:
+            print("No valid scan points found.")
+            return
 
-            for ix, iy in row_points:
-                self.grid_points.append((ix, iy))
-                px, py = self.idx_to_px(ix, iy)
-                self.canvas.create_oval(px - spot_radius_px, py - spot_radius_px,
-                                        px + spot_radius_px, py + spot_radius_px,
-                                        outline="red", tags="gridpoint")
+        # Order: axis-priority greedy nearest neighbor
+        path = []
+        current = candidates.pop(0)
+        path.append(current)
 
-        print(f"Generated {len(self.grid_points)} scan points.")
+        def axis_neighbors(curr, pool):
+            cx, cy = curr
+            out = []
+            for px, py in pool:
+                if (abs(px - cx) == 1 and py == cy) or (abs(py - cy) == 1 and px == cx):
+                    out.append((px, py))
+            return out
 
+        while candidates:
+            # prefer axis-aligned neighbor
+            axn = axis_neighbors(current, candidates)
+            if axn:
+                next_pt = axn[0]
+            else:
+                # fallback: Euclidean nearest
+                next_pt = min(candidates, key=lambda q: (q[0]-current[0])**2 + (q[1]-current[1])**2)
+            path.append(next_pt)
+            candidates.remove(next_pt)
+            current = next_pt
+
+        self.grid_points = path
+
+        # Draw spots
+        spot_radius_idx = (0.5 / 2) / self.galvo_step_um
+        spot_radius_px = spot_radius_idx * self.scale
+        for ix, iy in self.grid_points:
+            px, py = self.idx_to_px(ix, iy)
+            self.canvas.create_oval(px - spot_radius_px, py - spot_radius_px,
+                                    px + spot_radius_px, py + spot_radius_px,
+                                    outline="red", tags="gridpoint")
+
+        # Compute & draw big jumps
+        try:
+            jump_thresh_um = float(self.jump_thresh_entry.get())
+        except ValueError:
+            jump_thresh_um = 0.4
+        jump_thresh_idx = jump_thresh_um / self.galvo_step_um
+
+        for (a, b) in zip(self.grid_points, self.grid_points[1:]):
+            dx = abs(b[0] - a[0])
+            dy = abs(b[1] - a[1])
+            dist_idx = (dx*dx + dy*dy) ** 0.5
+            if dist_idx > jump_thresh_idx:
+                dist_um = dist_idx * self.galvo_step_um
+                self.big_jumps.append((a, b, dist_idx, dist_um))
+                ax, ay = self.idx_to_px(*a)
+                bx, by = self.idx_to_px(*b)
+                self.canvas.create_line(ax, ay, bx, by, fill="orange", width=2, dash=(4, 3), tags="jumpline")
+
+        print(f"Generated {len(self.grid_points)} scan points (axis-priority NN).")
+        print(f"Big jumps over {jump_thresh_um} µm: {len(self.big_jumps)}")
+        for i, (a, b, di, du) in enumerate(self.big_jumps[:50], 1):
+            print(f"  {i}. {a} -> {b}  jump = {du:.3f} µm ({di:.2f} idx)")
+        if len(self.big_jumps) > 50:
+            print(f"  ... and {len(self.big_jumps) - 50} more")
+
+    # --------- CSV export ---------
     def export_csv(self):
         if not self.grid_points:
             print("No grid to export!")
@@ -306,8 +390,10 @@ class ShapeGridGUI:
     def refresh_canvas(self):
         self.canvas.delete("shape")
         self.canvas.delete("gridpoint")
+        self.canvas.delete("jumpline")
         self.vertices.clear()
         self.grid_points.clear()
+        self.big_jumps.clear()
         self.polygon_drawn = False
         self.rect_start = None
         print("Canvas reset. Ready for new shape.")
